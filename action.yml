@@ -1,0 +1,959 @@
+name: 'Axiom Investigate'
+description: >-
+  Runs Axiom against a supported test report (JUnit-style XML, native TestNG XML,
+  pytest-json-report JSON, or Playwright JSON) to produce an evidence-backed root-cause
+  investigation, enriched with GitHub PR/commit context when available, and writes it to the job
+  summary. See docs/24-github-action-design.md.
+inputs:
+  rules-file:
+    description: >-
+      Path to the Axiom rules YAML file. May be omitted entirely on a supporting axiom-version: an
+      omitted rules-file uses an empty deterministic rule list -- no bundled/default heuristic of
+      any kind is substituted -- and the evidence-collection/correlation pipeline runs exactly as
+      it does with any rules file, abstaining to NEEDS_INVESTIGATION wherever evidence is
+      insufficient rather than guessing. When supplied, that file is used exactly as before; it is
+      never merged with or supplemented by anything built in. An older axiom-version that doesn't
+      understand an omitted rules-file yet falls back to its own existing required-rules usage
+      error.
+    required: false
+    default: ''
+  report-file:
+    description: >-
+      Path to a supported test report file to investigate -- JUnit-style XML (Maven
+      Surefire/Failsafe, Gradle, Ant), native TestNG XMLReporter output, the
+      `pytest-json-report` plugin's own JSON format, or Playwright's native `--reporter=json`
+      output. Format is always detected from the document's own real content (an XML document's
+      root element; a JSON document's own real structural shape), never from this path's
+      filename or extension -- the four formats may be freely mixed across multiple report-file
+      lines in the same investigation.
+      Automatic discovery (see the later paragraph below) only ever looks for JUnit-style or
+      native TestNG XML, explicitly rooted at the checkout root (`github.workspace`).
+      `pytest-json-report` and Playwright JSON are never automatically discovered -- a
+      deliberate choice, not a technical impossibility for both. `pytest-json-report` does have
+      a real default output path (a hidden `.report.json`, written in whatever directory pytest
+      itself ran from, whenever `--json-report` is passed without its own
+      `--json-report-file`), but it is too generic a signal to search for safely -- an unnamed,
+      hidden file wherever pytest happened to run, not a distinctively-named directory the way
+      Maven/Gradle's own conventions are. Playwright's JSON reporter has no default file at all
+      -- it prints to stdout unless `outputFile` is explicitly configured in
+      `playwright.config.ts` (or `PLAYWRIGHT_JSON_OUTPUT_NAME`). Both must currently be supplied
+      through an explicit report-file line or glob instead, resolved relative to this step's own
+      current working directory -- `github.workspace`, the default for every step in a job,
+      unless the calling workflow sets its own job- or workflow-level
+      `defaults.run.working-directory` (which, unlike a single step's own `working-directory:`,
+      is never settable on this `uses:` step directly, and is never inherited from a different,
+      earlier step's own override either way -- GitHub Actions carries neither forward to an
+      unrelated step). If
+      pytest itself ran in a subdirectory via its own, separate step's `working-directory:`,
+      name that subdirectory explicitly, relative to the checkout root, e.g. `report-file:
+      backend/.report.json` (pytest-json-report's own real default, inside a `backend`
+      subdirectory) rather than a bare `.report.json`. Other examples: `report-file:
+      test-results/*.json` (a glob -- see below for exactly how one expands), or `report-file:
+      playwright-report/results.json` (Playwright, whatever path your own
+      `playwright.config.ts` names as `outputFile`).
+      May contain multiple newline-separated paths to investigate several report documents as one
+      combined investigation, matching `axiom investigate`'s own repeated --report flag exactly --
+      not several independent investigations. A single path (today's existing usage) is
+      unchanged. Any line may instead be a glob pattern (e.g. `test-results/*.xml`) on a
+      supporting axiom-version -- expanded to every matching file, deterministically ordered;
+      a pattern matching nothing is a warning, never a failure. An existing, literal file is
+      always used as-is, never reinterpreted as a pattern no matter what characters its own name
+      contains. This Action's own automatically-derived report-occurrence-id (used only when the
+      caller never supplies report-occurrence-id explicitly) is withheld for a glob-looking line,
+      never guessed. A caller-supplied report-occurrence-id, however, passes through exactly as
+      given: paired with a glob that does not resolve to exactly one file, it is rejected with a
+      usage error rather than silently applied to several real documents -- supply
+      report-occurrence-id only alongside a --report value known to resolve to exactly one file.
+      May be omitted entirely on a supporting axiom-version: automatic discovery of
+      conventional Maven Surefire/Failsafe and Gradle JUnit-style XML reports then runs under the
+      checkout root (github.workspace), falling back to native TestNG XMLReporter output
+      (**/test-output/testng-results.xml) only when no JUnit-style conventional report is found --
+      the two are never combined, so a project producing both for the same run is never
+      investigated twice. Discovery itself adds no evidence collector
+      beyond locating which report to read -- it does not change this Action's existing, separate
+      --workspace/source-context-evidence behavior below, which applies exactly as it already does
+      today regardless of whether report-file is supplied. An older axiom-version that doesn't
+      understand this yet falls back to its own existing required-report usage error.
+    required: false
+    default: ''
+  commit-sha:
+    description: >-
+      Commit SHA whose test reports are being investigated. Defaults to the PR head SHA or
+      current workflow SHA. Only needed when the job invoking this action did not itself check
+      out the commit under test -- e.g. a trusted analysis job that consumes test-report
+      artifacts produced by a separate untrusted job, rather than running the tests itself. Most
+      callers should omit this and rely on the default.
+    required: false
+    default: ''
+  changes-file:
+    description: 'Optional path to a changes.json file. Ignored (with a notice) if repo/commit context is available -- see docs/23-github-cli-wiring-design.md §5.'
+    required: false
+    default: ''
+  execution-file:
+    description: 'Optional path to an execution.json file.'
+    required: false
+    default: ''
+  runtime-log-file:
+    description: >-
+      Optional path to a local runtime/application log file to check for a deterministic
+      exception-type or stack-frame match against each failure -- see
+      docs/59-runtime-log-evidence-design.md. May contain multiple newline-separated paths,
+      matching report-file's own convention exactly. A match never affects classification or
+      confidence; it is surfaced only as an observation in the investigation output. Requires an
+      axiom-version whose CLI understands --runtime-log; combining this with an older
+      axiom-version fails with an unrecognized-flag usage error.
+    required: false
+    default: ''
+  runtime-log-s3-file:
+    description: >-
+      Optional explicit s3://bucket/key object (or newline-separated list, matching report-file's
+      own convention) checked the same way runtime-log-file checks a local file -- no bucket
+      listing, no prefix expansion, no implicit discovery. See
+      docs/60-s3-runtime-log-acquisition-design.md. Requires AWS credentials to already be
+      configured in the environment before this action runs (e.g. via a prior
+      aws-actions/configure-aws-credentials step using OIDC) -- this action never sets up AWS
+      authentication itself and does not accept AWS credentials as an input. Requires an
+      axiom-version whose CLI understands --runtime-log-s3.
+    required: false
+    default: ''
+  runtime-log-gcs-file:
+    description: >-
+      Optional explicit gs://bucket/object (or newline-separated list, matching report-file's own
+      convention) checked the same way runtime-log-file checks a local file -- no bucket listing,
+      no prefix expansion, no implicit discovery. See
+      docs/61-gcs-runtime-log-acquisition-design.md. Requires Google Cloud Application Default
+      Credentials to already be configured in the environment before this action runs (e.g. via a
+      prior google-github-actions/auth step using Workload Identity Federation) -- this action
+      never sets up Google Cloud authentication itself and does not accept Google Cloud
+      credentials as an input. Requires an axiom-version whose CLI understands
+      --runtime-log-gcs.
+    required: false
+    default: ''
+  runtime-log-github-actions-job:
+    description: >-
+      Optional explicit GitHub Actions job id (or newline-separated list, matching report-file's
+      own convention) whose raw console log is checked the same way runtime-log-file checks a
+      local file -- no discovery, never guessed from commit-sha/the triggering run. See
+      docs/92-cross-source-investigation-phase3-github-actions-log-acquisition-design.md. Requires
+      repo/commit context (always present for this action) and reuses the exact same
+      AXIOM_GITHUB_TOKEN (github.token, already set unconditionally below) every other
+      GitHub-sourced evidence collector already uses -- a wholly separate credential from the
+      github-token input above, which only ever downloads the Axiom release asset itself. No new
+      authentication mechanism, unlike runtime-log-s3-file/runtime-log-gcs-file, which each require
+      their own prior cloud-auth step -- but the calling job's own `permissions:` must additionally
+      grant `actions: read` on the target repository; `contents: read` alone (sufficient for
+      changed-file evidence) is not enough, and this input degrades to a permission-denied
+      warning (not a failure) without it. Requires an axiom-version whose CLI understands
+      --runtime-log-github-actions-job.
+    required: false
+    default: ''
+  ci-log-github-actions-job:
+    description: >-
+      Optional explicit GitHub Actions job id (Phase 3 M3.5) -- single id only (unlike
+      runtime-log-github-actions-job above, no newline-separated list for this input yet) whose
+      raw console log is run through the same deterministic CI-log failure discovery as the CLI's
+      --ci-log, instead of being treated as corroborating evidence the way
+      runtime-log-github-actions-job is. Reached only when this run has no retained JUnit/TestNG
+      XML report at all (report-file produced none, and report-root-file's own discovery found
+      none either) -- the same "fallback, never additive" precedence --ci-log itself already has;
+      a report with zero failures is not the same as no report, and this input is never consulted
+      in that case. No discovery, never guessed from commit-sha/the triggering run -- the caller
+      must already know which job. Requires repo/commit context (always present for this action)
+      and reuses the exact same AXIOM_GITHUB_TOKEN (github.token, already set unconditionally
+      below) every other GitHub-sourced evidence collector already uses -- no new authentication
+      mechanism. The calling job's own `permissions:` must additionally grant `actions: read` on
+      the target repository; without it, this input degrades to a Collection warning (never a
+      failure), the same fail-soft contract runtime-log-github-actions-job already has. Requires
+      an axiom-version whose CLI understands --ci-log-github-actions-job.
+    required: false
+    default: ''
+  ci-log-github-actions-run:
+    description: >-
+      Optional explicit GitHub Actions workflow run id (Phase 3 M3.6) -- unlike
+      ci-log-github-actions-job above, the caller supplies a run id, not individual job ids;
+      Axiom discovers every job GitHub marks failed within that run's latest attempt and runs
+      each one's raw log through the same deterministic CI-log failure discovery. Reached only
+      when this run has no retained JUnit/TestNG XML report at all, and only when
+      ci-log-github-actions-job is also not supplied -- the same strict, never-additive fallback
+      precedence: XML report > local --ci-log > ci-log-github-actions-job > this input, exactly
+      the CLI's own --ci-log-github-actions-run precedence. No discovery of which run -- the
+      caller must already know the run id (e.g. a workflow re-analyzing a prior run via
+      workflow_dispatch). Requires repo/commit context (always present for this action) and
+      reuses the exact same AXIOM_GITHUB_TOKEN (github.token, already set unconditionally below)
+      every other GitHub-sourced evidence collector already uses -- no new authentication
+      mechanism. The calling job's own `permissions:` must additionally grant `actions: read` on
+      the target repository; without it, this input degrades to a Collection warning (never a
+      failure), the same fail-soft contract ci-log-github-actions-job already has. Requires an
+      axiom-version whose CLI understands --ci-log-github-actions-run.
+    required: false
+    default: ''
+  ci-log-github-actions-discover-run:
+    description: >-
+      Opt-in automatic GitHub Actions workflow-run resolution (Phase 3 M3.7) -- unlike
+      ci-log-github-actions-run above, no run id is supplied at all; Axiom resolves one
+      automatically from repo/commit context (optionally scoped by workflow-name below), then
+      reuses that exact same run-wide failed-job discovery unmodified. Set to exactly 'true' to
+      enable, the same boolean-input convention execute-actions already uses; blank/omitted (the
+      default) preserves every existing behavior exactly. Reached only when every higher-precedence
+      CI_LOG source (a retained XML report,
+      local --ci-log, ci-log-github-actions-job, ci-log-github-actions-run) is absent -- the new,
+      lowest tier of the same strict, never-additive precedence chain. Never silently selects an
+      arbitrary run: zero matching runs, more than one failed candidate, a run that has not
+      finished yet, a workflow-run lookup that cannot be proven complete, or a workflow-name that
+      does not resolve to exactly one active workflow all stop automatic discovery with an
+      explicit, sanitized note -- never a guess, and never an echoed raw provider error message.
+      Requires repo/commit context (always present for this action) and reuses the exact same
+      AXIOM_GITHUB_TOKEN every other GitHub-sourced evidence collector already uses -- no new
+      authentication mechanism. The calling job's own `permissions:` must additionally grant
+      `actions: read`, the same requirement ci-log-github-actions-run/ci-log-github-actions-job
+      already have. Requires an axiom-version whose CLI understands
+      --ci-log-github-actions-discover-run.
+    required: false
+    default: ''
+  workflow-name:
+    description: >-
+      Optional workflow display name (e.g. 'CI') -- a thin pass-through to the CLI's own,
+      pre-existing --workflow-name flag, not a new capability. Scopes two independent features
+      when each is itself enabled: execution-history search (history-artifact above), which
+      degrades gracefully to an unscoped search if the name does not resolve to exactly one
+      active workflow; and automatic GitHub Actions run discovery (Phase 3 M3.7,
+      ci-log-github-actions-discover-run above), which instead stops automatic discovery entirely
+      on the same ambiguity -- never silently broadening to a repository-wide search, which is
+      itself more likely to be ambiguous (most repositories run more than one workflow per push).
+      Both features share the identical workflow-lookup logic; only what happens on ambiguity
+      differs, by design. Requires an axiom-version whose CLI understands --workflow-name.
+    required: false
+    default: ''
+  runtime-log-gcp-logging-file:
+    description: >-
+      Optional path to a bounded Google Cloud Logging query-spec JSON file -- one or more queries,
+      each requiring project/logName plus exactly one of an explicit startTime+endTime window or a
+      bounded lookback duration. No unbounded/implicit search is possible: a query missing any
+      required field is skipped fail-soft, and hard limits apply to time window, entry count, page
+      count, and total bytes retrieved. See docs/62-gcp-logging-runtime-log-acquisition-design.md.
+      Requires Google Cloud Application Default Credentials to already be configured in the
+      environment before this action runs (e.g. via a prior google-github-actions/auth step using
+      Workload Identity Federation) -- this action never sets up Google Cloud authentication
+      itself and does not accept Google Cloud credentials as an input. Requires an axiom-version
+      whose CLI understands --runtime-log-gcp-logging.
+    required: false
+    default: ''
+  runtime-log-gcp-project:
+    description: >-
+      Large-Scale Evidence Retrieval V1 Slice 1 -- opt-in automatic Cloud Logging query planning
+      (MODE B), an alternative to the hand-authored runtime-log-gcp-logging-file above (MODE A);
+      the two are mutually exclusive. Must be supplied together with runtime-log-gcp-log-name and
+      runtime-log-gcp-lookahead below -- a partial group fails the investigation with a clear
+      usage error rather than guessing the missing piece. This action never infers project -- it
+      is always this explicit value. Axiom derives only the query's time window automatically,
+      from already-available failure/suite timestamps; see runtime-log-gcp-lookahead for why no
+      default window exists. Requires Google Cloud Application Default Credentials, the same as
+      runtime-log-gcp-logging-file above. Requires an axiom-version whose CLI understands
+      --runtime-log-gcp-project.
+    required: false
+    default: ''
+  runtime-log-gcp-log-name:
+    description: >-
+      Required together with runtime-log-gcp-project/runtime-log-gcp-lookahead. This action never
+      infers logName -- it is always this explicit value. Requires an axiom-version whose CLI
+      understands --runtime-log-gcp-log-name.
+    required: false
+    default: ''
+  runtime-log-gcp-lookahead:
+    description: >-
+      Required together with runtime-log-gcp-project/runtime-log-gcp-log-name: a positive
+      ISO-8601 duration (e.g. PT30M) added after the latest known failure/suite timestamp to form
+      the query's end bound; the start bound is the earliest known timestamp, with no look-behind
+      padding. Axiom has no universally trustworthy exact failure timestamp today (only an
+      optional suite-start timestamp where the report provides one), so this duration is always
+      this explicit value, never a built-in default. When no failure in the investigation carries
+      a usable timestamp, automatic planning is declined outright with an explicit notice --
+      never substituted with the current time. Requires an axiom-version whose CLI understands
+      --runtime-log-gcp-lookahead.
+    required: false
+    default: ''
+  history-file:
+    description: 'Optional path to a history.json file.'
+    required: false
+    default: ''
+  history-artifact:
+    description: >-
+      Optional exact name of a GitHub Actions artifact (uploaded by a prior workflow run)
+      containing JUnit XML reports, enabling GitHub-backed execution history in place of
+      history-file -- see docs/41-github-historical-execution-populator-design.md. There is no
+      universal naming convention across CI setups, so this must name the artifact exactly.
+      Ignored (with a notice) if history-file is also supplied.
+    required: false
+    default: ''
+  snapshot-output:
+    description: >-
+      Optional path for writing the frozen investigation snapshot, later usable both by `axiom
+      evaluate` and by `axiom resolve --snapshot` (see the resolution-history-path input below and
+      the README's "GitHub Action" section for the full recommended workflow). Written by the same
+      investigation this action already renders to the job summary -- not a second, separate run.
+      Omit to skip snapshot writing entirely (the default); persisting the resulting file (e.g. via
+      actions/upload-artifact) is the calling workflow's own concern, not this action's. Requires an
+      axiom-version whose CLI understands --snapshot-output; combining this with an older
+      axiom-version fails with an unrecognized-flag usage error.
+    required: false
+    default: ''
+  resolution-history-path:
+    description: >-
+      Optional path (already present in the checkout, e.g. `.axiom/resolved-failures`) to a
+      directory of real, engineer-confirmed resolution records (see `axiom resolve --snapshot` and
+      the README's "Investigation Knowledge Store" section). When supplied, a later failure whose
+      hardened similarity score clears Axiom's own actionable threshold surfaces the matching prior
+      resolution as labeled supporting evidence only -- never as this investigation's own asserted
+      root cause. Omit entirely (the default) for zero behavior change. Mutually exclusive with
+      `--similar-failures`, which this action never emits, so no conflict is possible from this
+      side. Requires an axiom-version whose CLI understands --resolution-history (every released
+      version from v1.1.0 onward); an older pinned version silently receives no flag at all rather
+      than an unknown-flag failure.
+
+      Persistence across separate workflow runs comes entirely from this path being *git-committed*
+      to the repository (the README's documented workflow: `axiom resolve` writes the record,
+      review and commit it through a normal pull request) -- `actions/checkout` then brings it
+      along on every subsequent run, the same way any other repository file is. A path that is not
+      committed (e.g. one written mid-job to `runner.temp`, or restored only from a same-run cache
+      without ever being committed back) will not carry any record forward into a later, separate
+      workflow run; this input itself performs no caching, restoration, or cross-run transport of
+      any kind -- it only tells this run's CLI invocation where to look in *this* run's own
+      checkout.
+    required: false
+    default: ''
+  axiom-version:
+    description: 'The released Axiom CLI version to install.'
+    required: false
+    default: 'v1.15.0'
+  github-token:
+    description: >-
+      Token used to download the Axiom release asset from Nandini1212/axiom-action, this
+      wrapper's own public release repository. No override is needed for a normal install --
+      the calling workflow's own default token is sufficient, since Nandini1212/axiom-action is
+      public and a release-asset download from it needs no authentication at all. This input
+      exists only for parity with the real Axiom action's own inputs.
+    required: false
+    default: ''
+  publish-pr-comment:
+    description: >-
+      Opt-in: publish a concise Markdown summary as a PR comment, converging on one current
+      comment across re-runs, in addition to the job summary Axiom always writes. Requires the
+      calling workflow to itself grant `pull-requests: write` (directly, or via
+      `pull_request_target` for fork PRs) -- this action cannot grant that permission to itself.
+      When the available token lacks write permission, publishing fails explicitly with a notice;
+      the investigation itself is unaffected. See docs/37-github-pr-comment-publishing-design.md.
+    required: false
+    default: 'false'
+  enable-synthesis:
+    description: >-
+      Opt-in: adds AI synthesis on top of the deterministic investigation -- a concise,
+      evidence-grounded explanation and recommended next step, in the job summary and, if
+      publish-pr-comment is also enabled, a short PR-comment summary. Requires llm-api-key.
+      Optional enrichment only: a missing key, a provider/network failure, a timeout, or a
+      synthesis that fails provenance validation all degrade to a notice in the output -- the
+      deterministic investigation itself always succeeds independently of this input.
+    required: false
+    default: 'false'
+  llm-api-key:
+    description: >-
+      API key for the AI provider used by enable-synthesis (Claude only, today). No default --
+      the caller supplies their own secret, the same shape as github-token for a private Axiom.
+      Only meaningful when enable-synthesis is 'true'; omitting it there is not an error, just
+      means synthesis is unavailable (see enable-synthesis's own description).
+    required: false
+    default: ''
+  execution-occurrence-id:
+    description: >-
+      Optional, caller-supplied, opaque identifier for the real test-suite execution these
+      report(s) came from -- one real act of running a test suite, which may produce one or more
+      report documents. Axiom never derives or validates this value; it is never populated from
+      github.run_id, github.run_attempt, github.job, strategy.job-index, a step id, a random id,
+      or a timestamp. Supply the same value when re-analyzing the same execution occurrence (even
+      via a different path or a fresh workspace), and a different value for genuinely independent
+      executions -- Axiom cannot verify either half of that contract itself. Invocation-scoped:
+      applies to every report-file path this invocation analyzes, never a subset; a workflow with
+      reports from independent executions must invoke this action once per execution. Requires an
+      axiom-version whose CLI understands --execution-occurrence-id; an older installed CLI never
+      receives this flag at all (the input is silently withheld, never causing an unknown-flag
+      failure), regardless of whether this input is set.
+    required: false
+    default: ''
+  action-namespace:
+    description: >-
+      Optional, explicit, opaque, caller-supplied identifier for the stable project/system
+      namespace within which future autonomous-action idempotency will be evaluated. Never
+      derived or inferred from github.repository, github.repository_id, the provider, or any
+      other ambient workflow context -- github.repository in particular is name-based and
+      rename-unstable, exactly the instability this field exists to avoid, so this action does
+      not default to it. The caller supplies the same value across a repository rename, a
+      workspace change, or a process restart, and a different value for a genuinely different
+      project/system. Requires an axiom-version whose CLI understands --action-namespace; an
+      older installed CLI never receives this flag at all (the input is silently withheld, never
+      causing an unknown-flag failure), regardless of whether this input is set.
+    required: false
+    default: ''
+  report-occurrence-id:
+    description: >-
+      Optional, caller/producer-supplied, opaque identifier for which report document a given
+      failure came from, matching `axiom investigate`'s own `--report`/`--report-occurrence-id`
+      immediate-pairing contract exactly. May contain multiple newline-separated values, one per
+      report-file line, applied strictly positionally: the first report-occurrence-id line pairs
+      with the first explicit report-file line, the second with the second, and so on. Blank by
+      default (no occurrence IDs supplied, today's existing behavior, fully unchanged). Only
+      meaningful together with an explicit report-file -- report auto-discovery has no per-line
+      list to pair against, so supplying this alongside a blank report-file (or a mismatched
+      number of lines) fails the Action clearly rather than silently mis-pairing an ID to the
+      wrong report. This input does not activate GitHub Action Shadow Mode auto-derivation
+      (docs/71 §6a) by itself; it is transport only, requiring the same explicit opt-in this
+      transport has always required. Requires an axiom-version whose CLI understands
+      --report-occurrence-id; an older installed CLI never receives this flag at all (the input
+      is silently withheld, never causing an unknown-flag failure), regardless of whether this
+      input is set.
+    required: false
+    default: ''
+  action-mode:
+    description: >-
+      Opt-in enablement gate for Axiom's autonomous-action decision capability. `off` (default):
+      no behavior change at all -- byte-identical to every prior release, including still
+      declining to evaluate any action when execution-occurrence-id/action-namespace/
+      report-occurrence-id are blank. `shadow`: for each failure, prints what Axiom would do
+      (would it propose creating an issue, and where) without executing anything -- zero GitHub
+      writes, zero issue creation, zero DynamoDB reads/writes of any kind. Only under `shadow`,
+      any of execution-occurrence-id/action-namespace/report-occurrence-id left blank is filled
+      with a deterministic default derived from this job's own run_id/run_attempt/job/job-index/
+      repository context (docs/71-github-action-shadow-mode-design.md §6a) -- an explicit value
+      for any of the three always wins over its derived default. This input has exactly two
+      recognized values in this milestone; anything other than exactly `shadow` (including a
+      typo, or `off`) behaves identically to omitting this input entirely -- there is no third
+      value, and no combination of inputs on this action reaches real autonomous execution
+      (`--execute-actions`) or destination-mapping, which remain entirely unexposed here.
+      Requires an axiom-version whose CLI understands --action-shadow; an older installed CLI
+      never receives it (silently withheld, never an unknown-flag failure) regardless of this
+      input.
+    required: false
+    default: 'off'
+  action-destination:
+    description: >-
+      Required only when action-mode is `shadow`: an explicit, opaque, logical destination
+      identifier for the action Axiom would propose (e.g. an issue tracker/repository
+      identifier meaningful to your own workflow) -- never inferred from github.repository or
+      any other ambient context. Feeds both the CLI's --action-destination and
+      --authorize-create-issue-destination with this identical value for shadow display, so a
+      shadow proposal targeting this destination is always self-authorized. A real write
+      additionally requires its own separate, explicit authorize-create-issue-destination and
+      action-destination-repository inputs below (execute-actions) -- shadow's own
+      self-authorization is never reused for a real, irreversible write. Leaving this blank while
+      action-mode is `shadow` still emits --action-shadow alone, which
+      the installed CLI itself rejects with its own existing, explicit usage error. Ignored
+      entirely when action-mode is `off` (the default). Requires an axiom-version whose CLI
+      understands --action-destination; an older installed CLI never receives it (silently
+      withheld, never an unknown-flag failure) regardless of this input.
+    required: false
+    default: ''
+  execute-actions:
+    description: >-
+      Opt-in, and independent of action-mode: when exactly 'true' (the only recognized true
+      value; anything else, including a typo, behaves identically to 'false'), AND action-mode is
+      exactly 'shadow' (action-mode: off always means no real execution either, regardless of this
+      input -- there is no action-mode: execute; it does not exist), AND
+      authorize-create-issue-destination is non-blank and exactly equals action-destination, AND
+      action-destination-repository is non-blank, Axiom may perform one real, durable,
+      policy-authorized GitHub issue-creation write for an eligible failure. 'false' (the default)
+      leaves this Action's behavior byte-for-byte unchanged from every prior release -- no existing
+      caller performs a real write merely by upgrading. Any one of the required companions above
+      being blank or mismatched means no real execution is attempted at all (a concise notice is
+      printed; the investigation itself always still succeeds) -- this input never causes a
+      partial or best-effort attempt. A Decision-2B/history-influence-promoted DETERMINED
+      diagnosis is never eligible for real execution in this version, even when every input above
+      is set correctly -- it still appears in shadow output when action-mode is shadow, but the
+      real write is declined. Real execution additionally requires execution-occurrence-id and
+      action-namespace to be explicitly, non-blank supplied by the caller: the shadow-only derived
+      defaults (see action-mode's own description) are never used for a real, irreversible write.
+      Real execution also requires AXIOM_ACTION_STORE_DYNAMODB_TABLE (an already-existing DynamoDB
+      table; this action never creates one) and AWS credentials/region resolved through the AWS
+      SDK's own default provider chain (e.g. a prior aws-actions/configure-aws-credentials step),
+      exactly like historical-feedback's own existing AWS requirement below -- this action never
+      sets up AWS authentication itself. Real execution reuses AXIOM_GITHUB_TOKEN
+      (github.token by default, already set for every invocation); the calling workflow must
+      itself grant `issues: write` for a real create to succeed -- this action cannot grant that
+      permission to itself, the same limitation publish-pr-comment's own `pull-requests: write`
+      requirement already documents. Requires an axiom-version whose CLI understands
+      --execute-actions; an older installed CLI never receives it (silently withheld, never an
+      unknown-flag failure), regardless of this input.
+    required: false
+    default: 'false'
+  authorize-create-issue-destination:
+    description: >-
+      Required only together with execute-actions: 'true' -- the caller's own explicit
+      confirmation that action-destination is authorized for a real write, which this action never
+      derives from action-destination itself (unlike action-mode: shadow's own collapsed
+      self-authorization, used only for the no-side-effect shadow path). Must exactly equal
+      action-destination (no normalization, no case-folding) or real execution is not attempted at
+      all. Ignored entirely when execute-actions is not 'true'. Requires an axiom-version whose CLI
+      understands --execute-actions; an older installed CLI never receives this flag at all
+      (silently withheld), regardless of this input.
+    required: false
+    default: ''
+  action-destination-repository:
+    description: >-
+      Required only together with execute-actions: 'true' -- the single literal `owner/repo`
+      GitHub repository action-destination resolves to for a real write (e.g. 'my-org/my-repo').
+      Composed internally into the equivalent of a one-entry --action-destination-mapping; this
+      action does not expose the CLI's general multi-entry destination-mapping shape in this
+      version. No wildcard, no default, no inference from github.repository. Ignored entirely when
+      execute-actions is not 'true'. Requires an axiom-version whose CLI understands
+      --execute-actions; an older installed CLI never receives this flag at all (silently
+      withheld), regardless of this input.
+    required: false
+    default: ''
+  historical-feedback:
+    description: >-
+      Opt-in: looks up developer feedback previously recorded (via the separate GitHub-native
+      feedback-capture workflow -- see the README's "GitHub-native developer feedback" section)
+      for failures sharing the current failure's exact fingerprint, surfaced as a purely
+      informational "Historical developer feedback" report section -- never influences this
+      investigation's own disposition/selectedCategory/confidence (see enable-history-influence
+      below for the separate, stronger opt-in that does). Reuses the exact same
+      AXIOM_FEEDBACK_HISTORY_TABLE DynamoDB table the feedback-capture workflow already writes to,
+      plus AWS credentials/region resolved entirely through the AWS SDK's own default
+      credential/region provider chain (e.g. a prior aws-actions/configure-aws-credentials step
+      using OIDC) -- this action never sets up AWS authentication itself and does not accept AWS
+      credentials, a table name, or an index name as inputs. Additionally requires
+      AXIOM_FEEDBACK_HISTORY_FINGERPRINT_INDEX, a GSI on that same table used only for this
+      fingerprint lookup (see the README's "Historical feedback" section for one-time setup) --
+      not a second table or a new AWS service. If either environment variable is missing or lookup
+      construction otherwise fails, historical feedback is skipped with a notice and the
+      deterministic investigation is unaffected. 'false' (the default) leaves existing Action
+      behavior byte-for-byte unchanged, with zero DynamoDB dependency. Requires an axiom-version
+      whose CLI understands --historical-feedback (every released version from v1.4.0 onward); an
+      older installed CLI never receives this flag at all (silently withheld, never an
+      unknown-flag failure), regardless of this input.
+    required: false
+    default: 'false'
+  enable-history-influence:
+    description: >-
+      Opt-in, and separate from (never implied by) historical-feedback above: allows verified,
+      unanimous, non-stale historical feedback to promote a NEEDS_INVESTIGATION disposition to
+      DETERMINED, but only in the narrow case where current evidence alone already cleared the
+      confidence threshold and had no blocking contradiction -- the only unresolved question was
+      margin over the next-ranked hypothesis. Never creates a category, never rescues low
+      confidence or a blocking contradiction, never changes hypothesis scores/ordering. See
+      docs/70-explainable-historical-reasoning-design.md. Requires historical-feedback to also be
+      'true' and repository context to be available -- this action always supplies repository
+      context unconditionally, so in practice only the historical-feedback requirement is
+      reachable through this input; setting this to 'true' while historical-feedback is 'false'
+      fails the investigation with the installed CLI's own existing, explicit usage error rather
+      than silently doing nothing. 'false' (the default) leaves existing Action behavior
+      byte-for-byte unchanged. Requires an axiom-version whose CLI understands
+      --enable-history-influence (every released version from v1.6.0 onward -- two minor releases
+      after historical-feedback's own v1.4.0 threshold); an older installed CLI never receives
+      this flag at all (silently withheld, never an unknown-flag failure), regardless of this
+      input.
+    required: false
+    default: 'false'
+
+  pr-impact:
+    description: >-
+      Opt-in. 'true' additionally runs `axiom pr-impact` -- a separate, deterministic,
+      read-only analysis (changed files, path-based affected components, naming-convention
+      test-reference findings, deterministic regression review indicators, and
+      test-recommendation findings) -- and appends it to the job summary as its own, clearly
+      labeled section alongside the existing investigation above. Never a regression-risk
+      score, never verified test coverage, never an AI narrative -- see pr-impact's own CLI
+      help for the exact contract. 'false' (the default) leaves existing Action behavior
+      byte-for-byte unchanged. Automatically uses full pull-request scope (every commit in the
+      pull request, base...head) whenever this run has a pull request number, single-commit
+      scope (this commit's own diff only) otherwise -- the same precedence the existing
+      investigation above already uses for --pr, never a separate input of its own. Requires
+      an axiom-version of v1.15.0 or newer -- the first version whose installed CLI correctly
+      paginates past GitHub's 300-changed-file page cap for pr-impact's own single-commit
+      scope rather than failing outright; every earlier released version (through the current
+      default) shares that defect, so this is deliberately a later threshold than the one
+      pr-impact itself first shipped under. On an older pinned axiom-version this input is
+      silently ignored (a clear Note is written to the job summary instead of a crash or an
+      unknown-command failure), the same "silently withheld" contract every other
+      not-yet-supported flag in this file already follows. A pr-impact failure (an unresolvable
+      commit, a GitHub API error, or a commit/pull request whose true changed-file count
+      cannot be proven complete) is reported as its own clearly labeled note in the job
+      summary and never affects this Action's own exit code, which remains exactly the
+      existing investigation's own result above, unaffected by whether pr-impact ran,
+      succeeded, or failed.
+    required: false
+    default: 'false'
+
+outputs:
+  action-proposed:
+    description: >-
+      "true" if and only if this investigation's action evaluation (action-mode: shadow)
+      authorized at least one autonomous action proposal for at least one failure -- i.e. Axiom
+      would create an issue, but did not. "false" otherwise: action-mode is off (the default),
+      every failure was declined (no actionable diagnosis, or an unauthorized destination), or
+      the investigation had no per-failure results at all. Never means an issue was actually
+      created, an external write occurred, history influenced the result, the diagnosis is
+      correct, or that a real write occurred (see execute-actions below for that, separate,
+      opt-in surface) -- it reports only whether ActionOrchestrator/ActionPolicy already
+      authorized a shadow proposal, exactly as already decided, never recomputed here, and is
+      "true" under execute-actions exactly when it would have been true under shadow display for
+      the same proposal, since both read the identical ActionOrchestrator result. Requires an
+      axiom-version whose CLI understands
+      --action-proposed-output; on an older installed CLI this output is always "false" (the flag
+      is silently withheld, never causing an unknown-flag failure), regardless of action-mode.
+    value: ${{ steps.investigate.outputs.action-proposed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '21'
+
+    - name: Install Axiom
+      id: install
+      shell: bash
+      env:
+        # install-axiom.sh uses `gh release download`, which needs a token to read a release
+        # from a private repository -- gh recognizes GH_TOKEN automatically. Falls back to the
+        # caller's own token (sufficient for a public Axiom, or a caller running inside the Axiom
+        # repo itself); a separate repo consuming a private Axiom must supply its own PAT via the
+        # github-token input, since a workflow's own token never reads a different private repo.
+        GH_TOKEN: ${{ inputs.github-token || github.token }}
+        AXIOM_RELEASE_REPOSITORY: Nandini1212/axiom-action
+      run: |
+        AXIOM_BIN=$("${{ github.action_path }}/install-axiom.sh" "${{ inputs.axiom-version }}")
+        echo "axiom-bin=$AXIOM_BIN" >> "$GITHUB_OUTPUT"
+
+    - name: Run investigation
+      id: investigate
+      shell: bash
+      env:
+        AXIOM_GITHUB_TOKEN: ${{ github.token }}
+        AXIOM_BIN: ${{ steps.install.outputs.axiom-bin }}
+        RULES_FILE: ${{ inputs.rules-file }}
+        REPORT_FILE: ${{ inputs.report-file }}
+        REPORT_OCCURRENCE_ID: ${{ inputs.report-occurrence-id }}
+        CI_LOG_GITHUB_ACTIONS_JOB: ${{ inputs.ci-log-github-actions-job }}
+        CI_LOG_GITHUB_ACTIONS_RUN: ${{ inputs.ci-log-github-actions-run }}
+        CI_LOG_GITHUB_ACTIONS_DISCOVER_RUN: ${{ inputs.ci-log-github-actions-discover-run }}
+        WORKFLOW_NAME: ${{ inputs.workflow-name }}
+        CHANGES_FILE: ${{ inputs.changes-file }}
+        EXECUTION_FILE: ${{ inputs.execution-file }}
+        RUNTIME_LOG_FILE: ${{ inputs.runtime-log-file }}
+        RUNTIME_LOG_S3_FILE: ${{ inputs.runtime-log-s3-file }}
+        RUNTIME_LOG_GCS_FILE: ${{ inputs.runtime-log-gcs-file }}
+        RUNTIME_LOG_GITHUB_ACTIONS_JOB: ${{ inputs.runtime-log-github-actions-job }}
+        RUNTIME_LOG_GCP_LOGGING_FILE: ${{ inputs.runtime-log-gcp-logging-file }}
+        RUNTIME_LOG_GCP_PROJECT: ${{ inputs.runtime-log-gcp-project }}
+        RUNTIME_LOG_GCP_LOG_NAME: ${{ inputs.runtime-log-gcp-log-name }}
+        RUNTIME_LOG_GCP_LOOKAHEAD: ${{ inputs.runtime-log-gcp-lookahead }}
+        HISTORY_FILE: ${{ inputs.history-file }}
+        HISTORY_ARTIFACT: ${{ inputs.history-artifact }}
+        SNAPSHOT_OUTPUT: ${{ inputs.snapshot-output }}
+        RESOLUTION_HISTORY_PATH: ${{ inputs.resolution-history-path }}
+        AXIOM_REPO: ${{ github.repository }}
+        # Precedence: an explicit commit-sha input always wins (the caller knows better than
+        # ambient workflow context which commit its own reports came from -- e.g. a trusted
+        # analysis job that never checked out the tested commit itself); otherwise fall back to
+        # the existing PR-head-SHA / github.sha resolution, unchanged from before this input
+        # existed.
+        AXIOM_COMMIT: ${{ inputs.commit-sha || github.event.pull_request.head.sha || github.sha }}
+        AXIOM_PR: ${{ github.event.pull_request.number }}
+        AXIOM_BRANCH: ${{ github.ref_name }}
+        AXIOM_WORKSPACE: ${{ github.workspace }}
+        # CI execution-cell identity -- see docs/24-github-action-design.md. run_id/run_attempt/
+        # job are always populated in any real Actions run; job-index is populated only for a
+        # matrix job (strategy.job-index), so it is transported conditionally below rather than
+        # assumed present.
+        AXIOM_RUN_ID: ${{ github.run_id }}
+        AXIOM_RUN_ATTEMPT: ${{ github.run_attempt }}
+        AXIOM_JOB: ${{ github.job }}
+        AXIOM_JOB_INDEX: ${{ strategy.job-index }}
+        # Caller-supplied only -- never derived from github.run_id/run_attempt/job/
+        # strategy.job-index, a step id, a random id, or a timestamp. Blank by default (the
+        # input's own default), same "absent means unknown" contract InvestigationContext itself
+        # documents.
+        AXIOM_EXECUTION_OCCURRENCE_ID: ${{ inputs.execution-occurrence-id }}
+        # Caller-supplied only -- never derived from github.repository or any other ambient
+        # workflow context. Blank by default (the input's own default), same "absent means
+        # unknown" contract InvestigationContext itself documents.
+        AXIOM_ACTION_NAMESPACE: ${{ inputs.action-namespace }}
+        ACTION_MODE: ${{ inputs.action-mode }}
+        ACTION_DESTINATION: ${{ inputs.action-destination }}
+        # Decision 3C Slice 1 -- all three blank by default (the inputs' own defaults), same
+        # "absent means not opted in" contract every other opt-in input here already follows.
+        EXECUTE_ACTIONS: ${{ inputs.execute-actions }}
+        AUTHORIZE_CREATE_ISSUE_DESTINATION: ${{ inputs.authorize-create-issue-destination }}
+        ACTION_DESTINATION_REPOSITORY: ${{ inputs.action-destination-repository }}
+        AXIOM_VERSION: ${{ inputs.axiom-version }}
+        PUBLISH_PR_COMMENT: ${{ inputs.publish-pr-comment }}
+        AXIOM_LLM_API_KEY: ${{ inputs.llm-api-key }}
+        ENABLE_SYNTHESIS: ${{ inputs.enable-synthesis }}
+        HISTORICAL_FEEDBACK: ${{ inputs.historical-feedback }}
+        ENABLE_HISTORY_INFLUENCE: ${{ inputs.enable-history-influence }}
+        PR_IMPACT: ${{ inputs.pr-impact }}
+      run: |
+        set -e
+
+        source "${{ github.action_path }}/report-args.sh"
+        source "${{ github.action_path }}/axiom-version-support.sh"
+        source "${{ github.action_path }}/markdown-fence.sh"
+
+        # --report-occurrence-id is opt-in and version-gated the same way execution-occurrence-id/
+        # action-namespace already are below, via build_report_occurrence_id_value (reusing
+        # version_supports_execution_identity, the same v1.4.0 capability check -- no new version
+        # threshold introduced). An unsupported version resolves EFFECTIVE_REPORT_OCCURRENCE_ID to
+        # a blank value, exactly as if the caller never supplied one, so build_report_args's own
+        # pairing/cardinality logic never even sees it and never risks emitting an unknown flag to
+        # an older installed CLI.
+        build_report_occurrence_id_value "$AXIOM_VERSION" "$REPORT_OCCURRENCE_ID"
+
+        # Decision 3B S2 (docs/71 §6a): shadow-only derived identity defaults. Computed and
+        # applied only when action-mode is exactly "shadow" and the installed CLI supports the
+        # same execution-identity capability line these three flags already require -- an
+        # unsupported version must never see a derived value either, matching every other flag in
+        # this file's own "silently withheld, never an unknown-flag failure" contract. A manual
+        # value for any of the three (EFFECTIVE_REPORT_OCCURRENCE_ID above, or a bare
+        # AXIOM_EXECUTION_OCCURRENCE_ID/AXIOM_ACTION_NAMESPACE below) always wins over its own
+        # derived default -- per-field, never all-or-nothing. action-mode off/omitted (anything
+        # other than exactly "shadow") performs no derivation at all, byte-identical to pre-3B
+        # behavior, including still declining when these remain blank.
+        #
+        # Decision 3C Slice 1 (AXIOM_DECISION_3C_EXPOSURE_BOUNDARY_DESIGN §6): this entire
+        # shadow-only derived-default block (all three components, including the multi-report
+        # positional report-occurrence-id derivation below) is additionally suppressed whenever
+        # EXECUTE_ACTIONS is "true" -- these derived values were designed and validated only for
+        # shadow's own no-side-effect display (§6a), never for an irreversible real write. Real
+        # execution must use only an explicit, caller-supplied execution-occurrence-id/
+        # action-namespace/report-occurrence-id; if any remains blank, the installed CLI's own
+        # existing MISSING_EXECUTION_OCCURRENCE_ID/MISSING_ACTION_NAMESPACE/
+        # MISSING_REPORT_OCCURRENCE_ID decline reasons apply unchanged -- no new lifecycle state.
+        EFFECTIVE_EXECUTION_OCCURRENCE_ID="$AXIOM_EXECUTION_OCCURRENCE_ID"
+        EFFECTIVE_ACTION_NAMESPACE="$AXIOM_ACTION_NAMESPACE"
+        if [ "$ACTION_MODE" = "shadow" ] && [ "$EXECUTE_ACTIONS" != "true" ] \
+            && [ "$(version_supports_execution_identity "$AXIOM_VERSION")" = "true" ]; then
+          build_shadow_identity_defaults "$AXIOM_RUN_ID" "$AXIOM_RUN_ATTEMPT" "$AXIOM_JOB" "$AXIOM_JOB_INDEX" "$AXIOM_REPO"
+          [ -z "$EFFECTIVE_EXECUTION_OCCURRENCE_ID" ] && EFFECTIVE_EXECUTION_OCCURRENCE_ID="$DERIVED_EXECUTION_OCCURRENCE_ID"
+          [ -z "$EFFECTIVE_ACTION_NAMESPACE" ] && EFFECTIVE_ACTION_NAMESPACE="$DERIVED_ACTION_NAMESPACE"
+          if [ -z "$EFFECTIVE_REPORT_OCCURRENCE_ID" ]; then
+            build_derived_report_occurrence_id "$EFFECTIVE_EXECUTION_OCCURRENCE_ID" "$REPORT_FILE"
+            EFFECTIVE_REPORT_OCCURRENCE_ID="$DERIVED_REPORT_OCCURRENCE_ID"
+          fi
+        fi
+
+        build_report_args "$REPORT_FILE" "$EFFECTIVE_REPORT_OCCURRENCE_ID"
+        build_runtime_log_args "$RUNTIME_LOG_FILE"
+        build_runtime_log_s3_args "$RUNTIME_LOG_S3_FILE"
+        build_runtime_log_gcs_args "$RUNTIME_LOG_GCS_FILE"
+        build_runtime_log_github_actions_args "$RUNTIME_LOG_GITHUB_ACTIONS_JOB"
+
+        ARGS=(investigate)
+        # Optional-rules startup-MVP milestone: an omitted rules-file must never synthesize a
+        # rules file, an empty YAML file, or any bundled/default rule content -- it simply omits
+        # --rules entirely, letting a supporting installed CLI use its own empty deterministic
+        # rule list. No version gate is needed here (unlike --report-root/execution-identity,
+        # which risk an older CLI rejecting an *unrecognized flag* if sent unconditionally): an
+        # older CLI given no --rules at all just surfaces its own pre-existing, correctly-worded
+        # "Missing required flag: --rules" usage error -- the same safe outcome either way.
+        [ -n "$RULES_FILE" ] && ARGS+=(--rules "$RULES_FILE")
+        ARGS+=("${ARGS_REPORT[@]}")
+        # Version-gated (release-readiness follow-up to Phase 3 M3.5/M3.6/M3.7): all three of
+        # --ci-log-github-actions-job/-run/-discover-run previously appended unconditionally, which
+        # meant a caller on this action's own current default axiom-version (or any explicitly
+        # older pin) hit a hard "Unknown flag" crash the moment any of these inputs was set, since
+        # that installed binary predates all three flags -- confirmed directly, not assumed (see
+        # version_supports_github_actions_ci_log's own comment in axiom-version-support.sh). Each
+        # build_ci_log_github_actions_*_args call below silently withholds its own flag against an
+        # unsupported version (never a crash) and sets its own *_DECLINED_REASON only when the
+        # caller actually tried to use it, so the printed Note appears only when it is actionable.
+        build_ci_log_github_actions_job_args "$AXIOM_VERSION" "$CI_LOG_GITHUB_ACTIONS_JOB"
+        if [ -n "$CI_LOG_GITHUB_ACTIONS_JOB_DECLINED_REASON" ]; then
+          echo "Note: $CI_LOG_GITHUB_ACTIONS_JOB_DECLINED_REASON"
+        fi
+        ARGS+=("${ARGS_CI_LOG_GITHUB_ACTIONS_JOB[@]}")
+        build_ci_log_github_actions_run_args "$AXIOM_VERSION" "$CI_LOG_GITHUB_ACTIONS_RUN"
+        if [ -n "$CI_LOG_GITHUB_ACTIONS_RUN_DECLINED_REASON" ]; then
+          echo "Note: $CI_LOG_GITHUB_ACTIONS_RUN_DECLINED_REASON"
+        fi
+        ARGS+=("${ARGS_CI_LOG_GITHUB_ACTIONS_RUN[@]}")
+        build_ci_log_github_actions_discover_run_args "$AXIOM_VERSION" "$CI_LOG_GITHUB_ACTIONS_DISCOVER_RUN"
+        if [ -n "$CI_LOG_GITHUB_ACTIONS_DISCOVER_RUN_DECLINED_REASON" ]; then
+          echo "Note: $CI_LOG_GITHUB_ACTIONS_DISCOVER_RUN_DECLINED_REASON"
+        fi
+        ARGS+=("${ARGS_CI_LOG_GITHUB_ACTIONS_DISCOVER_RUN[@]}")
+        # Shared by two independent features (history scoping, already existing, and M3.7's
+        # automatic run discovery above) -- a single pass-through, never duplicated per feature.
+        # --workflow-name itself predates v1.15.0 (it already exists for history scoping), so it
+        # keeps its own, separate, unconditional-append precedent -- only the three *new* CI_LOG
+        # flags above needed this release's own version gate.
+        [ -n "$WORKFLOW_NAME" ] && ARGS+=(--workflow-name "$WORKFLOW_NAME")
+        ARGS+=("${ARGS_RUNTIME_LOG[@]}")
+        ARGS+=("${ARGS_RUNTIME_LOG_S3[@]}")
+        ARGS+=("${ARGS_RUNTIME_LOG_GCS[@]}")
+        ARGS+=("${ARGS_RUNTIME_LOG_GITHUB_ACTIONS[@]}")
+        # Unlike --runtime-log/--runtime-log-s3/--runtime-log-gcs (repeatable atomic references),
+        # a Cloud Logging query spec is an inherently multi-field, bounded specification -- one
+        # file (possibly containing several bounded queries) is the whole input, so this is a
+        # plain single-value pass-through matching --changes/--execution's own convention, not a
+        # new report-args.sh helper function.
+        [ -n "$RUNTIME_LOG_GCP_LOGGING_FILE" ] && ARGS+=(--runtime-log-gcp-logging "$RUNTIME_LOG_GCP_LOGGING_FILE")
+        # Large-Scale Evidence Retrieval V1 Slice 1 -- MODE B, a straightforward three-value
+        # pass-through mirroring MODE A's own convention immediately above; the installed CLI
+        # itself (not this script) rejects a partial group or a MODE A/MODE B combination with a
+        # clear usage error.
+        [ -n "$RUNTIME_LOG_GCP_PROJECT" ] && ARGS+=(--runtime-log-gcp-project "$RUNTIME_LOG_GCP_PROJECT")
+        [ -n "$RUNTIME_LOG_GCP_LOG_NAME" ] && ARGS+=(--runtime-log-gcp-log-name "$RUNTIME_LOG_GCP_LOG_NAME")
+        [ -n "$RUNTIME_LOG_GCP_LOOKAHEAD" ] && ARGS+=(--runtime-log-gcp-lookahead "$RUNTIME_LOG_GCP_LOOKAHEAD")
+        [ -n "$CHANGES_FILE" ] && ARGS+=(--changes "$CHANGES_FILE")
+        [ -n "$EXECUTION_FILE" ] && ARGS+=(--execution "$EXECUTION_FILE")
+        [ -n "$HISTORY_FILE" ] && ARGS+=(--history "$HISTORY_FILE")
+        [ -n "$HISTORY_ARTIFACT" ] && ARGS+=(--history-artifact "$HISTORY_ARTIFACT")
+        [ -n "$SNAPSHOT_OUTPUT" ] && ARGS+=(--snapshot-output "$SNAPSHOT_OUTPUT")
+
+        ARGS+=(--repo "$AXIOM_REPO" --commit "$AXIOM_COMMIT")
+        [ -n "$AXIOM_PR" ] && ARGS+=(--pr "$AXIOM_PR")
+        # --run-id/--run-attempt/--job/--job-index are new flags an older installed CLI (including
+        # the default axiom-version) does not understand -- gated the same way --workspace already
+        # is, via axiom-version-support.sh, rather than passed unconditionally.
+        build_execution_identity_args "$AXIOM_VERSION" "$AXIOM_RUN_ID" "$AXIOM_RUN_ATTEMPT" "$AXIOM_JOB" "$AXIOM_JOB_INDEX"
+        ARGS+=("${ARGS_EXECUTION_IDENTITY[@]}")
+        # --execution-occurrence-id is opt-in (blank unless the caller explicitly set the Action
+        # input, or -- under action-mode: shadow -- the §6a derived default above) and
+        # version-gated the same way -- an older installed CLI never receives it, regardless of
+        # whether the input is set.
+        build_execution_occurrence_args "$AXIOM_VERSION" "$EFFECTIVE_EXECUTION_OCCURRENCE_ID"
+        ARGS+=("${ARGS_EXECUTION_OCCURRENCE[@]}")
+        # --action-namespace is opt-in (blank unless the caller explicitly set the Action input,
+        # or -- under action-mode: shadow -- the §6a derived default above) and version-gated the
+        # same way, reusing the same execution-identity capability check -- an older installed CLI
+        # never receives it, regardless of whether this input is set.
+        build_action_namespace_args "$AXIOM_VERSION" "$EFFECTIVE_ACTION_NAMESPACE"
+        ARGS+=("${ARGS_ACTION_NAMESPACE[@]}")
+        # Decision 3B S2 (docs/71 §6/§14): action-mode: shadow derives --action-shadow plus
+        # --action-destination/--authorize-create-issue-destination (identical value, Option B)
+        # from action-destination. action-mode off/omitted, or an unsupported version, produce no
+        # flags at all -- byte-identical to pre-3B behavior. Never emits --execute-actions or
+        # --action-destination-mapping itself -- see build_execute_actions_args immediately below,
+        # the one and only place either flag can be emitted.
+        build_action_shadow_args "$AXIOM_VERSION" "$ACTION_MODE" "$ACTION_DESTINATION"
+        ARGS+=("${ARGS_ACTION_SHADOW[@]}")
+        # Decision 3C Slice 1 (AXIOM_DECISION_3C_EXPOSURE_BOUNDARY_DESIGN §5/§6/§7): the one place
+        # --execute-actions/--action-destination-mapping can ever be emitted. Fails closed to
+        # emitting nothing (a concise, deterministic notice instead) unless EXECUTE_ACTIONS is
+        # exactly "true", ACTION_MODE is exactly "shadow" (action-mode: execute does not exist),
+        # AUTHORIZE_CREATE_ISSUE_DESTINATION is non-blank and exactly equals ACTION_DESTINATION
+        # (this action's own explicit confirmation, never derived from shadow's self-authorized
+        # collapse above), and ACTION_DESTINATION_REPOSITORY is non-blank. The authorize value this
+        # function emits is positioned after build_action_shadow_args's own above, so it is the
+        # authoritative, last-parsed value the installed CLI sees for --authorize-create-issue-
+        # destination -- by construction identical to shadow's own value whenever both are present,
+        # since this function requires an exact match before emitting anything at all.
+        build_execute_actions_args "$EXECUTE_ACTIONS" "$AXIOM_VERSION" "$ACTION_MODE" "$ACTION_DESTINATION" \
+          "$AUTHORIZE_CREATE_ISSUE_DESTINATION" "$ACTION_DESTINATION_REPOSITORY"
+        if [ -n "$EXECUTE_ACTIONS_DECLINED_REASON" ]; then
+          echo "Note: $EXECUTE_ACTIONS_DECLINED_REASON; diagnosis is unaffected, and no external action will be executed."
+        fi
+        ARGS+=("${ARGS_EXECUTE_ACTIONS[@]}")
+        # Decision 3B S4 (docs/71 §14): an internal plumbing detail, not a user-facing input --
+        # unconditionally passed (version-gated only) regardless of action-mode, since a
+        # supporting CLI always writes exactly "true"/"false" to this path (see
+        # InvestigateCommand's own --action-proposed-output contract), never something a calling
+        # workflow needs to configure. $RUNNER_TEMP is a GitHub Actions-provided per-job scratch
+        # directory -- never the checkout workspace, never persisted past the job.
+        ACTION_PROPOSED_OUTPUT_PATH="$RUNNER_TEMP/axiom-action-proposed.txt"
+        build_action_proposed_output_args "$AXIOM_VERSION" "$ACTION_PROPOSED_OUTPUT_PATH"
+        ARGS+=("${ARGS_ACTION_PROPOSED_OUTPUT[@]}")
+        # github.workspace is always populated in any Actions run, but --workspace only exists
+        # starting v1.2.0 -- an older installed CLI rejects an unknown flag outright ("Unknown
+        # flag: --workspace", exit 2), so this is gated on axiom-version rather than passed
+        # unconditionally. Automatic (not a separate opt-in input) once the CLI is new enough: a
+        # caller invoking this action outside a normal checkout still degrades safely, since
+        # source-context resolution finds no matching file and abstains. build_workspace_args
+        # itself is directly tested (test-axiom-version-support.sh) -- this line only consumes
+        # its result, the same way build_report_args's own call site does above.
+        build_workspace_args "$AXIOM_VERSION" "$AXIOM_WORKSPACE"
+        ARGS+=("${ARGS_WORKSPACE[@]}")
+        # GitHub Action Resolution-History Loop: resolution-history-path is opt-in (blank unless
+        # the caller explicitly sets it) and version-gated the same way --workspace already is,
+        # via axiom-version-support.sh -- --resolution-history itself has shipped since v1.1.0, but
+        # an older pinned axiom-version (only v1.0.0 today) must still receive no flag at all
+        # rather than an unknown-flag failure. build_resolution_history_args itself is directly
+        # tested (test-axiom-version-support.sh).
+        build_resolution_history_args "$AXIOM_VERSION" "$RESOLUTION_HISTORY_PATH"
+        ARGS+=("${ARGS_RESOLUTION_HISTORY[@]}")
+        # Report auto-discovery (Product MVP M1): only ever adds --report-root, never touches
+        # --workspace/source-context above -- that behavior predates this and is unconditional
+        # regardless of whether report-file was supplied. build_report_root_args itself already
+        # suppresses --report-root whenever REPORT_FILE is non-blank (explicit --report always
+        # wins) or AXIOM_WORKSPACE is blank, and version-gates it the same way every other
+        # not-yet-released flag in this file already is.
+        build_report_root_args "$AXIOM_VERSION" "$REPORT_FILE" "$AXIOM_WORKSPACE"
+        ARGS+=("${ARGS_REPORT_ROOT[@]}")
+        # A PR investigation resolves its own base branch via the GitHub API and does not need
+        # --branch; a push/nightly run (no PR) has no other way to know its branch, so pass it
+        # explicitly -- see docs/41-github-historical-execution-populator-design.md MVP §3.
+        [ -z "$AXIOM_PR" ] && [ -n "$HISTORY_ARTIFACT" ] && ARGS+=(--branch "$AXIOM_BRANCH")
+        # --publish-pr-comment requires --pr (InvestigateCommand's own usage-error contract) --
+        # only add it when a PR actually exists, so a push build with no PR degrades to
+        # job-summary-only instead of failing with a usage error.
+        [ -n "$AXIOM_PR" ] && [ "$PUBLISH_PR_COMMENT" = "true" ] && ARGS+=(--publish-pr-comment)
+        # --synthesize has no such prerequisite -- unlike --publish-pr-comment, InvestigateCommand
+        # itself already soft-degrades on every synthesis failure mode (missing AXIOM_LLM_API_KEY
+        # included), so this is a plain, unconditional pass-through, not a guarded one.
+        [ "$ENABLE_SYNTHESIS" = "true" ] && ARGS+=(--synthesize)
+        # historical-feedback/enable-history-influence are independent opt-ins, version-gated on
+        # their own separate thresholds (v1.4.0 and v1.6.0 respectively -- confirmed directly via
+        # `git tag --contains` against the commits that introduced each, not guessed; see
+        # axiom-version-support.sh's own comments on both functions). Neither builder checks the
+        # other's input or AWS/DynamoDB environment configuration -- a caller who enables
+        # enable-history-influence without historical-feedback gets --enable-history-influence
+        # alone, which the installed CLI's own existing usage error rejects explicitly, the same
+        # "don't duplicate a validation the CLI already owns" discipline build_action_shadow_args
+        # already applies to its own action-destination requirement.
+        build_historical_feedback_args "$AXIOM_VERSION" "$HISTORICAL_FEEDBACK"
+        ARGS+=("${ARGS_HISTORICAL_FEEDBACK[@]}")
+        build_history_influence_args "$AXIOM_VERSION" "$ENABLE_HISTORY_INFLUENCE"
+        ARGS+=("${ARGS_HISTORY_INFLUENCE[@]}")
+
+        set +e
+        REPORT_OUTPUT=$("$AXIOM_BIN" "${ARGS[@]}")
+        EXIT_CODE=$?
+        set -e
+
+        write_fenced_summary_block "Axiom Investigation" "$REPORT_OUTPUT"
+
+        # pr-impact is a fully separate, optional capability -- its own success or failure must
+        # never affect this Action's own exit code, which stays exactly the investigation's own
+        # EXIT_CODE above (already set, not reassigned below). build_pr_impact_args itself applies
+        # the version gate and the PR-vs-single-commit scope selection; this block only decides
+        # what to do with its own, already-validated result (run it, or explain why not).
+        build_pr_impact_args "$PR_IMPACT" "$AXIOM_VERSION" "$AXIOM_REPO" "$AXIOM_COMMIT" "$AXIOM_PR"
+        if [ -n "$PR_IMPACT_DECLINED_REASON" ]; then
+          echo "Note: $PR_IMPACT_DECLINED_REASON; the investigation above is unaffected." >> "$GITHUB_STEP_SUMMARY"
+        elif [ "${#ARGS_PR_IMPACT[@]}" -gt 0 ]; then
+          set +e
+          PR_IMPACT_OUTPUT=$("$AXIOM_BIN" "${ARGS_PR_IMPACT[@]}" 2>&1)
+          PR_IMPACT_EXIT_CODE=$?
+          set -e
+          if [ "$PR_IMPACT_EXIT_CODE" -eq 0 ]; then
+            write_fenced_summary_block "Axiom PR Impact" "$PR_IMPACT_OUTPUT"
+          else
+            write_fenced_summary_block "Axiom PR Impact" \
+              "PR Impact Analysis could not complete (exit $PR_IMPACT_EXIT_CODE); the investigation above is unaffected."$'\n\n'"$PR_IMPACT_OUTPUT"
+          fi
+        fi
+
+        # Decision 3B S4 (docs/71 §14): "false" is the correct default whenever the file was never
+        # written -- an older installed CLI that silently never received --action-proposed-output
+        # (see build_action_proposed_output_args above), or action-mode: off on a supporting CLI,
+        # which itself already writes "false" explicitly; either way, "no proposal" is the honest
+        # default, never an error. The file's own content is trusted verbatim (already exactly
+        # "true" or "false" by InvestigateCommand's own contract) -- no parsing of
+        # $REPORT_OUTPUT/console text of any kind.
+        ACTION_PROPOSED_VALUE="false"
+        if [ -f "$ACTION_PROPOSED_OUTPUT_PATH" ]; then
+          ACTION_PROPOSED_VALUE="$(cat "$ACTION_PROPOSED_OUTPUT_PATH")"
+        fi
+        echo "action-proposed=$ACTION_PROPOSED_VALUE" >> "$GITHUB_OUTPUT"
+
+        exit $EXIT_CODE
