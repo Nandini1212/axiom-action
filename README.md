@@ -23,9 +23,9 @@ steps:
     run: ./gradlew test
   - name: Investigate any failures
     if: always()
-    uses: Nandini1212/axiom-action@v1.15.0
+    uses: Nandini1212/axiom-action@v1.15.1
     with:
-      axiom-version: 'v1.15.0'
+      axiom-version: 'v1.15.1'
 ```
 
 **Python** (pytest, via `pytest-json-report`):
@@ -39,9 +39,9 @@ steps:
     run: pytest --json-report --json-report-file=.report.json
   - name: Investigate any failures
     if: always()
-    uses: Nandini1212/axiom-action@v1.15.0
+    uses: Nandini1212/axiom-action@v1.15.1
     with:
-      axiom-version: 'v1.15.0'
+      axiom-version: 'v1.15.1'
       report-file: .report.json
 ```
 
