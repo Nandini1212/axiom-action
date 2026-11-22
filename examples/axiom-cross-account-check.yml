@@ -1,13 +1,18 @@
 name: Axiom cross-account readiness check (self-asserting)
 
 # Validates two separate things, kept explicitly distinct throughout:
-#   1. Installation: did the real, public Nandini1212/axiom-action@v1.15.1 composite action
-#      itself actually install a genuine, checksum-matching Axiom distribution?
+#   1. Installation: did the real, public Nandini1212/axiom-action@v1.15.1
+#      composite action itself actually install a genuine, checksum-matching Axiom distribution?
 #   2. Diagnostic output: did that installed binary produce a real, schema-correct
 #      investigation for a pinned, deterministic failure? (This fixture supplies no committed
 #      source-change evidence, so NEEDS_INVESTIGATION is an expected, correct outcome here --
 #      this step never claims root-cause correctness, only that real evidence-backed JSON came
 #      back from the real binary.)
+#
+# This is the CANONICAL source for this example -- see prepare-public-action-wrapper.sh, which
+# substitutes Nandini1212/axiom-action/v1.15.1 below into the real wrapper
+# repository and version before this file is ever published. Never hand-edit a copy of this file
+# directly in the published wrapper repository; change this file and regenerate instead.
 
 on: workflow_dispatch
 permissions:
@@ -20,7 +25,7 @@ jobs:
       - name: Checkout this repository (the external customer's own repo)
         uses: actions/checkout@v4
 
-      - name: Checkout axiom-action's own files at the exact pinned ref
+      - name: Checkout the Action's own files at the exact pinned ref
         # Read-only, public, no token. Used only to statically inspect the real tagged
         # action.yml/install-axiom.sh -- never to re-run installation logic ourselves.
         uses: actions/checkout@v4
@@ -114,7 +119,10 @@ jobs:
         # Fully independent of the Action and of the step above: downloads the public release
         # asset itself via a plain curl against the public release URL, verifies ITS checksum,
         # extracts it with the real safe-unzip.sh, and compares against the files the Action
-        # actually produced (resolved above, never re-installed here).
+        # actually produced (resolved above, never re-installed here) -- both by relative file
+        # path/presence and by each file's own content hash, never a single combined tree hash
+        # alone (which could coincidentally match even if individual files differed in a way
+        # that cancels out, or could hide a path that's missing/extra in one side).
         env:
           AXIOM_BIN: ${{ steps.resolve.outputs.axiom-bin }}
         run: |
@@ -122,22 +130,41 @@ jobs:
           chmod +x axiom-action-scripts/verify-checksum.sh axiom-action-scripts/safe-unzip.sh
           WORKDIR="$(mktemp -d)"
           cd "$WORKDIR"
-          curl -sSL -o axiom.zip https://github.com/Nandini1212/axiom-action/releases/download/v1.15.1/axiom.zip
-          curl -sSL -o axiom.zip.sha256 https://github.com/Nandini1212/axiom-action/releases/download/v1.15.1/axiom.zip.sha256
+          curl -sSL -o axiom.zip "https://github.com/Nandini1212/axiom-action/releases/download/v1.15.1/axiom.zip"
+          curl -sSL -o axiom.zip.sha256 "https://github.com/Nandini1212/axiom-action/releases/download/v1.15.1/axiom.zip.sha256"
           EXPECTED="$(tr -d '[:space:]' < axiom.zip.sha256)"
           "$GITHUB_WORKSPACE/axiom-action-scripts/verify-checksum.sh" axiom.zip "$EXPECTED"
           echo "Checksum verified against the real published release asset, independently of the Action."
+
           "$GITHUB_WORKSPACE/axiom-action-scripts/safe-unzip.sh" axiom.zip "$WORKDIR/my-own-extracted"
-          hash_tree() {
-            find "$1" -type f -print0 | sort -z | xargs -0 shasum -a 256 | awk '{print $1}' | shasum -a 256 | awk '{print $1}'
-          }
-          MY_HASH="$(hash_tree "$WORKDIR/my-own-extracted/axiom")"
-          INSTALLED_HASH="$(hash_tree "$(dirname "$(dirname "$AXIOM_BIN")")")"
-          if [ "$MY_HASH" != "$INSTALLED_HASH" ]; then
-            echo "FAIL: what the Action actually installed does not match the independently-downloaded, checksum-verified public release" >&2
+          INSTALLED_DIR="$(dirname "$(dirname "$AXIOM_BIN")")"
+
+          # Relative file paths first: every file in my own independently-verified extraction
+          # must exist in the installed directory, and vice versa -- a hash comparison alone
+          # would not by itself prove the set of paths is identical.
+          ( cd "$WORKDIR/my-own-extracted/axiom" && find . -type f | sort ) > mine.paths
+          ( cd "$INSTALLED_DIR" && find . -type f | sort ) > installed.paths
+          if ! diff -u mine.paths installed.paths; then
+            echo "FAIL: the installed file set does not match the independently-extracted archive's own file set" >&2
             exit 1
           fi
-          echo "Confirmed: the Action's own installed files are byte-identical to the independently-verified public release archive."
+          echo "Confirmed: identical relative file paths between my own extraction and the installed distribution."
+
+          # Then each file's own content, not a single combined tree hash:
+          MISMATCHES=0
+          while IFS= read -r relpath; do
+            MY_HASH="$(shasum -a 256 "$WORKDIR/my-own-extracted/axiom/$relpath" | cut -d' ' -f1)"
+            INSTALLED_HASH="$(shasum -a 256 "$INSTALLED_DIR/$relpath" | cut -d' ' -f1)"
+            if [ "$MY_HASH" != "$INSTALLED_HASH" ]; then
+              echo "FAIL: content mismatch at $relpath (mine: $MY_HASH, installed: $INSTALLED_HASH)" >&2
+              MISMATCHES=$((MISMATCHES + 1))
+            fi
+          done < mine.paths
+          if [ "$MISMATCHES" -ne 0 ]; then
+            echo "FAIL: $MISMATCHES file(s) differed in content between the independently-verified archive and the installed distribution" >&2
+            exit 1
+          fi
+          echo "Confirmed: every installed file's own content is byte-identical to the independently-verified public release archive."
 
       - name: "DIAGNOSTIC VALIDATION -- assert real investigation JSON content, not just file existence"
         env:

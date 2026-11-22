@@ -1,9 +1,8 @@
 # Cross-account validation example
 
 A self-asserting GitHub Actions workflow an independent developer can copy into their own
-repository to verify, end to end, that `Nandini1212/axiom-action@v1.15.1` installs correctly and
-produces a real investigation -- with no access of any kind to the private `Nandini1212/axiom`
-source repository.
+repository to verify, end to end, that the public Axiom Action installs correctly and produces a
+real investigation -- with no access of any kind to the private Axiom source repository.
 
 ## Use it
 
