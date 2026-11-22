@@ -1,0 +1,161 @@
+name: Axiom cross-account readiness check (self-asserting)
+
+# Validates two separate things, kept explicitly distinct throughout:
+#   1. Installation: did the real, public Nandini1212/axiom-action@v1.15.1 composite action
+#      itself actually install a genuine, checksum-matching Axiom distribution?
+#   2. Diagnostic output: did that installed binary produce a real, schema-correct
+#      investigation for a pinned, deterministic failure? (This fixture supplies no committed
+#      source-change evidence, so NEEDS_INVESTIGATION is an expected, correct outcome here --
+#      this step never claims root-cause correctness, only that real evidence-backed JSON came
+#      back from the real binary.)
+
+on: workflow_dispatch
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repository (the external customer's own repo)
+        uses: actions/checkout@v4
+
+      - name: Checkout axiom-action's own files at the exact pinned ref
+        # Read-only, public, no token. Used only to statically inspect the real tagged
+        # action.yml/install-axiom.sh -- never to re-run installation logic ourselves.
+        uses: actions/checkout@v4
+        with:
+          repository: Nandini1212/axiom-action
+          ref: v1.15.1
+          path: axiom-action-scripts
+
+      - name: "Statically confirm the Action's own tagged contract (source inspection, not re-derivation)"
+        # This is what the Action step below will actually do internally -- confirmed by reading
+        # its own real, pinned source, not by a separate invocation that could silently diverge
+        # from it. Two facts, both load-bearing for later steps:
+        #   (a) the composite action always points its own internal install at the public
+        #       wrapper repository, never the private Axiom source;
+        #   (b) the installer's own real INSTALL_DIR contract, so later steps never hardcode a
+        #       path without having verified it against the real script first.
+        run: |
+          set -euo pipefail
+          if ! grep -qF 'AXIOM_RELEASE_REPOSITORY: Nandini1212/axiom-action' axiom-action-scripts/action.yml; then
+            echo "FAIL: the tagged action.yml does not pin its install to the public wrapper repository" >&2
+            exit 1
+          fi
+          # Single-quoted deliberately: a literal grep pattern matching install-axiom.sh's own
+          # source text verbatim, never meant to expand $HOME/$VERSION in this shell.
+          # shellcheck disable=SC2016
+          if ! grep -qF 'INSTALL_DIR="${2:-$HOME/.axiom/$VERSION}"' axiom-action-scripts/install-axiom.sh; then
+            echo "FAIL: install-axiom.sh's own INSTALL_DIR contract does not match what this workflow assumes" >&2
+            exit 1
+          fi
+          echo "Confirmed from the real tagged source: the Action installs only from Nandini1212/axiom-action, into \$HOME/.axiom/<version>."
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install pytest pytest-json-report
+
+      - name: Generate a deterministic, pinned fixture
+        run: |
+          mkdir -p fixture
+          cat > fixture/test_known_defect.py << 'EOF'
+          def add(a, b):
+              return a - b  # deliberate, pinned defect
+
+          def test_add_reports_correct_sum():
+              assert add(2, 2) == 4
+          EOF
+
+      - name: Run the fixture and produce a real pytest-json-report
+        working-directory: fixture
+        continue-on-error: true
+        run: pytest --json-report --json-report-file=.report.json
+
+      - name: Verify the report contains exactly one failure
+        run: |
+          test -s fixture/.report.json
+          python3 -c "
+          import json
+          d = json.load(open('fixture/.report.json'))
+          assert d['summary']['failed'] == 1, d['summary']
+          print('Report verified: exactly one real failure, as pinned.')
+          "
+
+      - name: "Investigate with the public Axiom Action (contents: read only)"
+        uses: Nandini1212/axiom-action@v1.15.1
+        with:
+          axiom-version: 'v1.15.1'
+          report-file: fixture/.report.json
+
+      - name: "INSTALLATION VALIDATION -- confirm the Action step itself produced a real install"
+        # Observes the Action's own side effect directly -- no second install-axiom.sh
+        # invocation anywhere in this workflow, so there is no path by which a later,
+        # independent install could succeed and mask an earlier Action failure. If the Action
+        # step above failed, this job already stopped before reaching this step at all (default
+        # GitHub Actions behavior, no continue-on-error anywhere above it).
+        id: resolve
+        run: |
+          set -euo pipefail
+          AXIOM_BIN="$HOME/.axiom/v1.15.1/axiom/bin/axiom"
+          MARKER="$HOME/.axiom/v1.15.1/.install-verified-sha256"
+          if [ ! -x "$AXIOM_BIN" ]; then
+            echo "FAIL: the Action step completed, but no executable binary exists at the real installer contract path ($AXIOM_BIN)" >&2
+            exit 1
+          fi
+          if [ ! -s "$MARKER" ]; then
+            echo "FAIL: no checksum-verification marker exists -- the Action's own install may not have gone through its real checksum-verified path" >&2
+            exit 1
+          fi
+          echo "axiom-bin=$AXIOM_BIN" >> "$GITHUB_OUTPUT"
+          echo "INSTALLATION VALIDATION: PASS -- the real Action produced a checksum-verified install at its own documented contract path."
+
+      - name: Independently verify that install against the published release archive
+        # Fully independent of the Action and of the step above: downloads the public release
+        # asset itself via a plain curl against the public release URL, verifies ITS checksum,
+        # extracts it with the real safe-unzip.sh, and compares against the files the Action
+        # actually produced (resolved above, never re-installed here).
+        env:
+          AXIOM_BIN: ${{ steps.resolve.outputs.axiom-bin }}
+        run: |
+          set -euo pipefail
+          chmod +x axiom-action-scripts/verify-checksum.sh axiom-action-scripts/safe-unzip.sh
+          WORKDIR="$(mktemp -d)"
+          cd "$WORKDIR"
+          curl -sSL -o axiom.zip https://github.com/Nandini1212/axiom-action/releases/download/v1.15.1/axiom.zip
+          curl -sSL -o axiom.zip.sha256 https://github.com/Nandini1212/axiom-action/releases/download/v1.15.1/axiom.zip.sha256
+          EXPECTED="$(tr -d '[:space:]' < axiom.zip.sha256)"
+          "$GITHUB_WORKSPACE/axiom-action-scripts/verify-checksum.sh" axiom.zip "$EXPECTED"
+          echo "Checksum verified against the real published release asset, independently of the Action."
+          "$GITHUB_WORKSPACE/axiom-action-scripts/safe-unzip.sh" axiom.zip "$WORKDIR/my-own-extracted"
+          hash_tree() {
+            find "$1" -type f -print0 | sort -z | xargs -0 shasum -a 256 | awk '{print $1}' | shasum -a 256 | awk '{print $1}'
+          }
+          MY_HASH="$(hash_tree "$WORKDIR/my-own-extracted/axiom")"
+          INSTALLED_HASH="$(hash_tree "$(dirname "$(dirname "$AXIOM_BIN")")")"
+          if [ "$MY_HASH" != "$INSTALLED_HASH" ]; then
+            echo "FAIL: what the Action actually installed does not match the independently-downloaded, checksum-verified public release" >&2
+            exit 1
+          fi
+          echo "Confirmed: the Action's own installed files are byte-identical to the independently-verified public release archive."
+
+      - name: "DIAGNOSTIC VALIDATION -- assert real investigation JSON content, not just file existence"
+        env:
+          AXIOM_BIN: ${{ steps.resolve.outputs.axiom-bin }}
+        run: |
+          "$AXIOM_BIN" investigate --report fixture/.report.json --format json > result.json
+          python3 - << 'PYEOF'
+          import json
+          d = json.load(open("result.json"))
+          assert "failures" in d and len(d["failures"]) == 1, d
+          failure = d["failures"][0]
+          # Confirms this JSON genuinely reflects the pinned fixture, not merely a schema-correct
+          # but disconnected document.
+          assert "test_add_reports_correct_sum" in failure.get("testLabel", ""), failure
+          a = failure["assessment"]
+          assert set(["disposition", "selectedCategory", "rankedHypotheses"]).issubset(a.keys()), a
+          assert a["disposition"] in ("DETERMINED", "NEEDS_INVESTIGATION"), a
+          print("DIAGNOSTIC VALIDATION: PASS -- real, schema-correct, fixture-matching investigation JSON produced.")
+          print("Disposition:", a["disposition"], "-- this fixture supplies no committed change evidence, so this is")
+          print("NOT a claim of root-cause correctness, only that the real pipeline ran end to end.")
+          PYEOF
